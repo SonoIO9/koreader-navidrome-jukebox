@@ -1,4 +1,5 @@
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local UIManager = require("ui/uimanager")
 local Menu = require("ui/widget/menu")
 local InputDialog = require("ui/widget/inputdialog")
@@ -14,6 +15,8 @@ local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local Font = require("ui/font")
 local Size = require("ui/size")
+local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local Screen = Device.screen
@@ -27,13 +30,170 @@ local ltn12 = require("ltn12")
 local API_VERSION = "1.12.0"
 local CLIENT_NAME = "koreader-navidrome"
 
+--------------------------------------------------------------------------
+-- Diálogo del reproductor (Now Playing)
+--
+-- Es un InputContainer de pantalla completa: consume los toques que no van
+-- a un botón (para que no se filtren al menú de debajo) y, al cerrarse,
+-- fuerza un repintado. Sin ese repintado el diálogo desaparecía de la
+-- pila de ventanas pero sus píxeles quedaban "fantasma" en la pantalla, y
+-- se iban borrando a trozos con cada toque posterior.
+--------------------------------------------------------------------------
+
+local PlayerDialog = InputContainer:extend{
+    plugin = nil,
+    is_playing = false,
+    cover_id = nil,
+    title_text = "",
+    subtitle_text = "",
+    -- Modal: se apila por encima de cualquier ventana no modal y absorbe
+    -- los eventos no consumidos por sus botones.
+    modal = true,
+}
+
+function PlayerDialog:init()
+    local plugin = self.plugin
+    local content_width = Screen:getWidth() * 0.8
+    self.cover_size = math.floor(Screen:getWidth() * 0.6)
+
+    self.cover_holder = CenterContainer:new{
+        dimen = Geom:new{ w = self.cover_size, h = self.cover_size },
+    }
+    self.title_widget = TextBoxWidget:new{
+        text = self.title_text or "",
+        width = content_width,
+        face = Font:getFace("cfont", 20),
+        alignment = "center",
+    }
+    self.subtitle_widget = TextBoxWidget:new{
+        text = self.subtitle_text or "",
+        width = content_width,
+        face = Font:getFace("cfont", 16),
+        alignment = "center",
+    }
+    self.text_group = VerticalGroup:new{
+        align = "center",
+        self.title_widget,
+        self.subtitle_widget,
+    }
+
+    local btn_size = Screen:scaleBySize(56)
+    self.playpause_btn = Button:new{
+        text = self.is_playing and "⏹" or "▶",
+        width = btn_size,
+        callback = function() plugin:playerToggle(self.is_playing) end,
+    }
+    self.buttons_row = HorizontalGroup:new{
+        Button:new{ text = "◀◀", width = btn_size, callback = function() plugin:playerSkip(-1) end },
+        self.playpause_btn,
+        Button:new{ text = "▶▶", width = btn_size, callback = function() plugin:playerSkip(1) end },
+        Button:new{ text = "🔀", width = btn_size, callback = function() plugin:playerShuffle() end },
+        Button:new{ text = "⟳", width = btn_size, callback = function() plugin:refreshNowPlaying() end },
+        Button:new{ text = "✕", width = btn_size, callback = function() self:onClose() end },
+    }
+
+    self.content_group = VerticalGroup:new{
+        align = "center",
+        self.cover_holder,
+        self.text_group,
+        self.buttons_row,
+    }
+
+    self[1] = CenterContainer:new{
+        dimen = Screen:getSize(),
+        FrameContainer:new{
+            background = Blitbuffer.COLOR_WHITE,
+            radius = Size.radius.window,
+            padding = Size.padding.large,
+            bordersize = Size.border.window,
+            self.content_group,
+        },
+    }
+
+    -- Teclas físicas: atrás / inicio cierran el reproductor.
+    self.key_events = {
+        Close = { { "Back" }, { "Home" } },
+    }
+    -- Toques en cualquier parte: los consumimos para que no lleguen al
+    -- menú que hay debajo. Los botones, al ser hijos, se procesan antes.
+    self.ges_events = {
+        TapAnywhere = {
+            GestureRange:new{
+                ges = "tap",
+                range = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() },
+            },
+        },
+    }
+
+    self:setCover(self.cover_id)
+end
+
+function PlayerDialog:setText(title, subtitle, is_playing)
+    if title then self.title_widget:setText(title) end
+    if subtitle then self.subtitle_widget:setText(subtitle) end
+    if is_playing ~= nil then
+        self.is_playing = is_playing
+        self.playpause_btn:setText(is_playing and "⏹" or "▶")
+    end
+    -- Los contenedores cachean su tamaño; hay que invalidarlo al cambiar
+    -- el texto para que el layout se recalcule.
+    self.text_group:resetLayout()
+    self.content_group:resetLayout()
+end
+
+function PlayerDialog:setCover(cover_id)
+    local plugin = self.plugin
+    self.cover_id = cover_id
+    local size = 400
+    local path = plugin:getCachedCoverPath(cover_id, size)
+    local key = tostring(cover_id or "") .. "|" .. tostring(path or "")
+    if self.cover_key == key and self.cover_holder[1] then
+        return
+    end
+
+    self.cover_holder:clear()
+    if path then
+        table.insert(self.cover_holder, ImageWidget:new{
+            file = path,
+            width = self.cover_size,
+            height = self.cover_size,
+        })
+    else
+        table.insert(self.cover_holder, TextWidget:new{
+            text = "🎵",
+            face = Font:getFace("cfont", 60),
+        })
+    end
+    self.cover_key = key
+    self.content_group:resetLayout()
+end
+
+function PlayerDialog:onTapAnywhere()
+    -- Consumimos el toque: no cierra y no se propaga hacia abajo.
+    return true
+end
+
+function PlayerDialog:onClose()
+    UIManager:close(self)
+    return true
+end
+
+function PlayerDialog:onCloseWidget()
+    -- Evita que el plugin siga usando un diálogo ya cerrado.
+    if self.plugin and self.plugin.player_dialog == self then
+        self.plugin.player_dialog = nil
+    end
+    -- Repinta lo que quedaba debajo. Esto es lo que arregla el "fantasma".
+    UIManager:setDirty(nil, "ui")
+end
+
 local NavidromePlugin = WidgetContainer:extend{
     name = "navidrome",
     is_doc_only = false,
 }
 
 --------------------------------------------------------------------------
--- Inicializacion
+-- Inicialización
 --------------------------------------------------------------------------
 
 function NavidromePlugin:init()
@@ -49,10 +209,9 @@ function NavidromePlugin:ensureCacheDir()
     else
         base = "/tmp/navidrome_covers"
     end
-    -- NOTE: ffi/util no expone makePath (vive en frontend/util.lua).
-    -- Antes se llamaba pcall(ffiUtil.makePath, ...), que fallaba en silencio
-    -- y dejaba el directorio sin crear: por eso io.open(...,"wb") fallaba y
-    -- la caratula nunca se descargaba.
+    -- makePath vive en frontend/util.lua, NO en ffi/util. El original
+    -- llamaba ffiUtil.makePath, que no existe: el pcall lo ocultaba, la
+    -- carpeta nunca se creaba y por eso no se descargaba la carátula.
     local created_ok = pcall(util.makePath, base)
     if not created_ok or not util.pathExists(base) then
         base = "/tmp/navidrome_covers"
@@ -70,7 +229,7 @@ function NavidromePlugin:addToMainMenu(menu_items)
 end
 
 --------------------------------------------------------------------------
--- Configuracion y ajustes
+-- Configuración y ajustes
 --------------------------------------------------------------------------
 
 function NavidromePlugin:getSetting(key, default)
@@ -122,7 +281,7 @@ end
 function NavidromePlugin:apiRequest(endpoint, params)
     local config = self:getConfig()
     if config.url == "" or config.user == "" or config.pass == "" then
-        return nil, "Configura la direccion del servidor y las credenciales primero."
+        return nil, "Configura la dirección del servidor y las credenciales primero."
     end
 
     local query_params = {
@@ -139,7 +298,7 @@ function NavidromePlugin:apiRequest(endpoint, params)
     local url = config.url .. "/rest/" .. endpoint .. "?" .. self:makeQuery(query_params)
     local response_body = {}
 
-    -- Timeouts acotados: sin esto, LuaSocket espera hasta 60 s y la UI
+    -- Timeouts acotados: sin esto LuaSocket espera hasta 60 s y la UI
     -- parece "colgada" hasta que el usuario toca la pantalla.
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local ok, result, code, _, status = pcall(http.request, {
@@ -161,7 +320,7 @@ function NavidromePlugin:apiRequest(endpoint, params)
 
     local decoded_ok, data = pcall(rapidjson.decode, table.concat(response_body))
     if not decoded_ok or type(data) ~= "table" then
-        return nil, "El servidor devolvio una respuesta JSON invalida."
+        return nil, "El servidor devolvió una respuesta JSON inválida."
     end
 
     local response = data["subsonic-response"]
@@ -170,7 +329,7 @@ function NavidromePlugin:apiRequest(endpoint, params)
     end
     if response.status == "failed" then
         local message = response.error and response.error.message
-        return nil, "Navidrome: " .. tostring(message or "la solicitud fallo")
+        return nil, "Navidrome: " .. tostring(message or "la solicitud falló")
     end
     return response
 end
@@ -189,7 +348,7 @@ end
 
 function NavidromePlugin:safeList(value)
     if type(value) ~= "table" then return {} end
-    -- Algunas respuestas Subsonic envian un objeto cuando solo hay un resultado.
+    -- Algunas respuestas Subsonic envían un objeto cuando solo hay un resultado.
     if value.id or value.name or value.title then return { value } end
     return value
 end
@@ -201,7 +360,7 @@ function NavidromePlugin:safeStr(value, fallback)
 end
 
 --------------------------------------------------------------------------
--- Caratulas: descarga + cache en disco
+-- Carátulas: descarga + caché en disco
 --------------------------------------------------------------------------
 
 function NavidromePlugin:getCoverArtPath(cover_id, size)
@@ -223,7 +382,7 @@ function NavidromePlugin:getCoverArtPath(cover_id, size)
     local url = config.url .. "/rest/getCoverArt.view?" .. query
 
     -- Descargamos a un fichero temporal y renombramos, para no dejar
-    -- caratulas a medias en la cache si la descarga falla.
+    -- carátulas a medias en la caché si la descarga falla.
     local tmp_filename = filename .. ".part"
     local out_file = io.open(tmp_filename, "wb")
     if not out_file then return nil end
@@ -253,59 +412,59 @@ end
 
 function NavidromePlugin:showCoverArt(cover_id, title)
     if not cover_id or cover_id == "" then
-        self:showMessage("Este elemento no tiene caratula disponible.")
+        self:showMessage("Este elemento no tiene carátula disponible.")
         return
     end
     local path = self:getCoverArtPath(cover_id, 600)
     if not path then
-        self:showMessage("No se pudo descargar la caratula.")
+        self:showMessage("No se pudo descargar la carátula.")
         return
     end
     UIManager:show(ImageViewer:new{
         file = path,
         fullscreen = true,
         with_title_bar = true,
-        title_text = title or "Caratula",
+        title_text = title or "Carátula",
     })
 end
 
 --------------------------------------------------------------------------
--- Menu principal
+-- Menú principal
 --------------------------------------------------------------------------
 
 function NavidromePlugin:showMainMenu()
     local items = {
-        { text = "Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
-        { text = "Buscar musica", callback = function() self:showSearch() end },
-        { text = "Albumes recien anadidos", callback = function() self:showRecentAlbums() end },
-        { text = "Albumes aleatorios", callback = function() self:showRandomAlbums() end },
-        { text = "Artistas mas escuchados", callback = function() self:showTopArtists() end },
-        { text = "Descubre artistas", callback = function() self:showRecommendedArtists() end },
-        { text = "Controles rapidos del Jukebox", callback = function() self:showQuickControls() end },
-        { text = "Configurar servidor y cuenta", callback = function() self:configure(1) end },
+        { text = "▶  Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
+        { text = "🔎  Buscar música", callback = function() self:showSearch() end },
+        { text = "🆕  Álbumes recién añadidos", callback = function() self:showRecentAlbums() end },
+        { text = "🎲  Álbumes aleatorios", callback = function() self:showRandomAlbums() end },
+        { text = "🔥  Artistas más escuchados", callback = function() self:showTopArtists() end },
+        { text = "✨  Descubre artistas", callback = function() self:showRecommendedArtists() end },
+        { text = "⚙  Controles rápidos del Jukebox", callback = function() self:showQuickControls() end },
+        { text = "🔧  Configurar servidor y cuenta", callback = function() self:configure(1) end },
     }
     UIManager:show(Menu:new{ title = "Navidrome Jukebox", item_table = items })
 end
 
 function NavidromePlugin:showQuickControls()
     local items = {
-        { text = "Detener reproduccion", callback = function() self:jukeboxAction("stop") end },
-        { text = "Reanudar reproduccion", callback = function() self:jukeboxAction("start") end },
-        { text = "Siguiente cancion", callback = function() self:jukeboxAction("skip") end },
-        { text = "Vaciar cola", callback = function() self:jukeboxAction("clear") end },
+        { text = "⏹  Detener reproducción", callback = function() self:jukeboxAction("stop") end },
+        { text = "▶  Reanudar reproducción", callback = function() self:jukeboxAction("start") end },
+        { text = "⏭  Siguiente canción", callback = function() self:jukeboxAction("skip") end },
+        { text = "🗑  Vaciar cola", callback = function() self:jukeboxAction("clear") end },
     }
-    UIManager:show(Menu:new{ title = "Controles rapidos", item_table = items })
+    UIManager:show(Menu:new{ title = "Controles rápidos", item_table = items })
 end
 
 function NavidromePlugin:configure(field_index)
     local fields = {
         { key = "url", title = "Servidor Navidrome", hint = "Ejemplo: https://musica.ejemplo.com" },
         { key = "user", title = "Usuario Navidrome", hint = "Nombre de usuario" },
-        { key = "pass", title = "Contrasena Navidrome", hint = "Se guarda localmente en KOReader" },
+        { key = "pass", title = "Contraseña Navidrome", hint = "Se guarda localmente en KOReader" },
     }
     local field = fields[field_index]
     if not field then
-        self:showMessage("Configuracion guardada. Comprueba la conexion desde Buscar musica.")
+        self:showMessage("Configuración guardada. Comprueba la conexión desde Buscar música.")
         return
     end
 
@@ -335,15 +494,15 @@ function NavidromePlugin:configure(field_index)
 end
 
 --------------------------------------------------------------------------
--- Jukebox: control basico
+-- Jukebox: control básico
 --------------------------------------------------------------------------
 
 function NavidromePlugin:jukeboxAction(action)
     local response, err = self:apiRequest("jukeboxControl.view", {{ "action", action }})
     if not response then self:showError(err); return end
     local messages = {
-        start = "Reproduccion iniciada.", stop = "Reproduccion detenida.",
-        skip = "Pasando a la siguiente cancion.", clear = "Cola vaciada.",
+        start = "Reproducción iniciada.", stop = "Reproducción detenida.",
+        skip = "Pasando a la siguiente canción.", clear = "Cola vaciada.",
     }
     self:showMessage(messages[action] or "Listo.")
 end
@@ -360,25 +519,25 @@ function NavidromePlugin:playSongs(ids, label)
     if not response then self:showError(err); return end
     response, err = self:apiRequest("jukeboxControl.view", {{ "action", "start" }})
     if not response then self:showError(err); return end
-    self:showMessage("Reproduciendo ahora:\n" .. tostring(label or "Seleccion"))
+    self:showMessage("Reproduciendo ahora:\n" .. tostring(label or "Selección"))
 end
 
 function NavidromePlugin:addSongs(ids, label)
-    if not ids or #ids == 0 then self:showMessage("No hay canciones para anadir."); return end
+    if not ids or #ids == 0 then self:showMessage("No hay canciones para añadir."); return end
     local response, err = self:jukeboxWithIds("add", ids)
     if not response then self:showError(err); return end
-    self:showMessage("Anadido a la cola:\n" .. tostring(label or "Seleccion"))
+    self:showMessage("Añadido a la cola:\n" .. tostring(label or "Selección"))
 end
 
 --------------------------------------------------------------------------
--- Busqueda
+-- Búsqueda
 --------------------------------------------------------------------------
 
 function NavidromePlugin:showSearch()
     local dialog
     dialog = InputDialog:new{
         title = "Buscar en Navidrome",
-        input_hint = "Artista, album o cancion",
+        input_hint = "Artista, álbum o canción",
         buttons = {
             {
                 { text = "Cancelar", callback = function() UIManager:close(dialog) end },
@@ -408,36 +567,36 @@ function NavidromePlugin:performSearch(query)
     local songs = self:safeList(result.song)
 
     if #artists > 0 then
-        table.insert(items, { text = "-- ARTISTAS --", callback = function() end })
+        table.insert(items, { text = "— ARTISTAS —", callback = function() end })
         for _, artist in ipairs(artists) do
             if artist.id then
                 local id = tostring(artist.id)
                 local name = self:safeStr(artist.name, "Artista desconocido")
-                table.insert(items, { text = "Artista: " .. name,
+                table.insert(items, { text = "🎤  " .. name,
                     callback = function() self:showArtist(id, name) end })
             end
         end
     end
     if #albums > 0 then
-        table.insert(items, { text = "-- ALBUMES --", callback = function() end })
+        table.insert(items, { text = "— ÁLBUMES —", callback = function() end })
         for _, album in ipairs(albums) do
             if album.id then
                 local id = tostring(album.id)
-                local name = self:safeStr(album.name or album.title, "Album sin nombre")
+                local name = self:safeStr(album.name or album.title, "Álbum sin nombre")
                 local artist = self:safeStr(album.artist, "Varios")
-                table.insert(items, { text = "Album: " .. name .. " - " .. artist,
+                table.insert(items, { text = "💿  " .. name .. " — " .. artist,
                     callback = function() self:showAlbum(id, name) end })
             end
         end
     end
     if #songs > 0 then
-        table.insert(items, { text = "-- CANCIONES --", callback = function() end })
+        table.insert(items, { text = "— CANCIONES —", callback = function() end })
         for _, song in ipairs(songs) do
             if song.id then
                 local id = tostring(song.id)
-                local title = self:safeStr(song.title, "Cancion sin titulo")
+                local title = self:safeStr(song.title, "Canción sin título")
                 local artist = self:safeStr(song.artist, "Artista desconocido")
-                table.insert(items, { text = "Reproducir: " .. title .. " - " .. artist,
+                table.insert(items, { text = "▶  " .. title .. " — " .. artist,
                     callback = function() self:playSongs({ id }, title) end })
             end
         end
@@ -456,16 +615,16 @@ function NavidromePlugin:showArtist(id, name)
     for _, album in ipairs(albums) do
         if album.id then
             local album_id = tostring(album.id)
-            local album_name = self:safeStr(album.name or album.title, "Album sin nombre")
+            local album_name = self:safeStr(album.name or album.title, "Álbum sin nombre")
             local year = self:safeStr(album.year, "")
-            local label = "Album: " .. album_name
+            local label = "💿  " .. album_name
             if year ~= "" then label = label .. " (" .. year .. ")" end
             table.insert(items, { text = label,
                 callback = function() self:showAlbum(album_id, album_name) end })
         end
     end
-    if #items == 0 then self:showMessage("Este artista no tiene albumes."); return end
-    UIManager:show(Menu:new{ title = "Albumes: " .. name, item_table = items })
+    if #items == 0 then self:showMessage("Este artista no tiene álbumes."); return end
+    UIManager:show(Menu:new{ title = "Álbumes: " .. name, item_table = items })
 end
 
 function NavidromePlugin:showAlbum(id, title)
@@ -480,28 +639,28 @@ function NavidromePlugin:showAlbum(id, title)
     end
 
     local cover_id = album.coverArt or id
-    table.insert(items, { text = "Ver portada",
+    table.insert(items, { text = "🖼  Ver portada",
         callback = function() self:showCoverArt(cover_id, title) end })
 
     if #playable_ids > 0 then
-        table.insert(items, { text = "Reproducir album ahora",
+        table.insert(items, { text = "▶  Reproducir álbum ahora",
             callback = function() self:playSongs(playable_ids, title) end })
-        table.insert(items, { text = "Anadir album a la cola",
+        table.insert(items, { text = "➕  Añadir álbum a la cola",
             callback = function() self:addSongs(playable_ids, title) end })
-        table.insert(items, { text = "-- CANCIONES --", callback = function() end })
+        table.insert(items, { text = "— CANCIONES —", callback = function() end })
     end
     for _, song in ipairs(songs) do
         if song.id then
             local song_id = tostring(song.id)
-            local song_title = self:safeStr(song.title, "Sin titulo")
+            local song_title = self:safeStr(song.title, "Sin título")
             local track = self:safeStr(song.track, "")
             local label = (track ~= "" and (track .. ". ") or "") .. song_title
             table.insert(items, { text = label,
                 callback = function() self:playSongs({ song_id }, song_title) end })
         end
     end
-    if #items == 0 then self:showMessage("Este album no tiene canciones disponibles."); return end
-    UIManager:show(Menu:new{ title = "Album: " .. title, item_table = items })
+    if #items == 0 then self:showMessage("Este álbum no tiene canciones disponibles."); return end
+    UIManager:show(Menu:new{ title = "Álbum: " .. title, item_table = items })
 end
 
 --------------------------------------------------------------------------
@@ -519,10 +678,10 @@ function NavidromePlugin:showAlbumList(title, list_type, size)
     for _, album in ipairs(albums) do
         if album.id then
             local id = tostring(album.id)
-            local name = self:safeStr(album.name or album.title, "Album sin nombre")
+            local name = self:safeStr(album.name or album.title, "Álbum sin nombre")
             local artist = self:safeStr(album.artist, "Varios")
             local year = self:safeStr(album.year, "")
-            local label = name .. " - " .. artist
+            local label = name .. " — " .. artist
             if year ~= "" then label = label .. " (" .. year .. ")" end
             table.insert(items, {
                 text = label,
@@ -530,21 +689,21 @@ function NavidromePlugin:showAlbumList(title, list_type, size)
             })
         end
     end
-    if #items == 0 then self:showMessage("No se encontraron albumes."); return end
+    if #items == 0 then self:showMessage("No se encontraron álbumes."); return end
     UIManager:show(Menu:new{ title = title, item_table = items })
 end
 
 function NavidromePlugin:showRecentAlbums()
-    self:showAlbumList("Albumes recien anadidos", "newest", 25)
+    self:showAlbumList("🆕  Álbumes recién añadidos", "newest", 25)
 end
 
 function NavidromePlugin:showRandomAlbums()
-    self:showAlbumList("Albumes aleatorios", "random", 25)
+    self:showAlbumList("🎲  Álbumes aleatorios", "random", 25)
 end
 
--- Aproximacion de "artistas mas escuchados": no existe un endpoint oficial
--- para esto en la API Subsonic, asi que agregamos el playCount de los
--- albumes mas frecuentes (type=frequent) agrupados por artista.
+-- Aproximación de "artistas más escuchados": no existe un endpoint oficial
+-- para esto en la API Subsonic, así que agregamos el playCount de los
+-- álbumes más frecuentes (type=frequent) agrupados por artista.
 function NavidromePlugin:showTopArtists()
     local response, err = self:apiRequest("getAlbumList2.view", {
         { "type", "frequent" }, { "size", 50 },
@@ -573,7 +732,7 @@ function NavidromePlugin:showTopArtists()
     for _, key in ipairs(order) do
         local data = artist_data[key]
         table.insert(items, {
-            text = data.name .. "  (aprox. " .. data.score .. " reproducciones)",
+            text = "🎤  " .. data.name .. "  (≈" .. data.score .. " reproducciones)",
             callback = function()
                 if data.id then
                     self:showArtist(data.id, data.name)
@@ -584,15 +743,15 @@ function NavidromePlugin:showTopArtists()
         })
     end
     if #items == 0 then
-        self:showMessage("Aun no hay suficiente historial de reproduccion en el servidor.")
+        self:showMessage("Aún no hay suficiente historial de reproducción en el servidor.")
         return
     end
-    UIManager:show(Menu:new{ title = "Artistas mas escuchados", item_table = items })
+    UIManager:show(Menu:new{ title = "🔥  Artistas más escuchados", item_table = items })
 end
 
--- "Recomendacion" real: la API Subsonic/Navidrome no ofrece un motor de
--- recomendaciones generico, asi que mostramos una seleccion aleatoria de
--- tu biblioteca para descubrir cosas que quizas tengas olvidadas.
+-- "Recomendación" real: la API Subsonic/Navidrome no ofrece un motor de
+-- recomendaciones genérico, así que mostramos una selección aleatoria de
+-- tu biblioteca para descubrir cosas que quizá tengas olvidadas.
 function NavidromePlugin:showRecommendedArtists()
     local response, err = self:apiRequest("getArtists.view", {})
     if not response then self:showError(err); return end
@@ -619,32 +778,18 @@ function NavidromePlugin:showRecommendedArtists()
         local id = tostring(artist.id)
         local name = self:safeStr(artist.name, "Artista desconocido")
         table.insert(items, {
-            text = name,
+            text = "✨  " .. name,
             callback = function() self:showArtist(id, name) end,
         })
     end
-    UIManager:show(Menu:new{ title = "Descubre artistas (seleccion aleatoria)", item_table = items })
+    UIManager:show(Menu:new{ title = "✨  Descubre artistas (selección aleatoria)", item_table = items })
 end
 
 --------------------------------------------------------------------------
 -- Reproductor visual (Now Playing)
 --------------------------------------------------------------------------
 
-function NavidromePlugin:closeNowPlaying()
-    if self.player_dialog then
-        UIManager:close(self.player_dialog)
-        self.player_dialog = nil
-    end
-    self.player_cover_holder = nil
-    self.player_title_widget = nil
-    self.player_subtitle_widget = nil
-    self.player_playpause_btn = nil
-    self.player_text_group = nil
-    self.player_content_group = nil
-    self.player_cover_shown_key = nil
-end
-
--- Devuelve la ruta en cache si la caratula ya esta descargada (sin red).
+-- Devuelve la ruta en caché si la carátula ya está descargada (sin red).
 function NavidromePlugin:getCachedCoverPath(cover_id, size)
     if not cover_id or cover_id == "" then return nil end
     size = tonumber(size) or 300
@@ -653,17 +798,30 @@ function NavidromePlugin:getCachedCoverPath(cover_id, size)
     return nil
 end
 
+function NavidromePlugin:closeNowPlaying()
+    if self.player_dialog then
+        UIManager:close(self.player_dialog)
+        self.player_dialog = nil
+    end
+end
+
 -- Muestra el reproductor al instante (estado "cargando") y deja la
--- consulta al servidor para el siguiente tick de la UI. Asi la pantalla
+-- consulta al servidor para el siguiente tick de la UI. Así la pantalla
 -- nunca se queda "colgada" esperando a la red.
 function NavidromePlugin:showNowPlaying()
     local config = self:getConfig()
     if config.url == "" or config.user == "" or config.pass == "" then
-        self:showError("Configura la direccion del servidor y las credenciales primero.")
+        self:showError("Configura la dirección del servidor y las credenciales primero.")
         return
     end
-    self:buildPlayerDialog("Cargando...", "Consultando el servidor", false, nil)
-    UIManager:forceRePaint()
+    self:closeNowPlaying()
+    self.player_dialog = PlayerDialog:new{
+        plugin = self,
+        title_text = "Cargando...",
+        subtitle_text = "Consultando el servidor",
+        is_playing = false,
+    }
+    UIManager:show(self.player_dialog)
     UIManager:nextTick(function() self:refreshNowPlaying() end)
 end
 
@@ -671,9 +829,13 @@ function NavidromePlugin:refreshNowPlaying()
     local response, err = self:apiRequest("jukeboxControl.view", {{ "action", "get" }})
     if not response then
         if not self.player_dialog then
-            self:buildPlayerDialog("Nada en reproduccion",
-                "Anade canciones o albumes desde Buscar / Albumes", false, nil)
-            UIManager:forceRePaint()
+            self.player_dialog = PlayerDialog:new{
+                plugin = self,
+                title_text = "Nada en reproducción",
+                subtitle_text = "Añade canciones o álbumes desde Buscar / Álbumes",
+                is_playing = false,
+            }
+            UIManager:show(self.player_dialog)
         end
         self:showError(err)
         return
@@ -690,33 +852,39 @@ function NavidromePlugin:refreshNowPlaying()
     self.player_queue_length = #entries
 
     local cover_id = nil
-    local title_text = "Nada en reproduccion"
-    local subtitle_text = "Anade canciones o albumes desde Buscar / Albumes"
+    local title_text = "Nada en reproducción"
+    local subtitle_text = "Añade canciones o álbumes desde Buscar / Álbumes"
     if current_song then
         cover_id = current_song.coverArt
-        title_text = self:safeStr(current_song.title, "Sin titulo")
+        title_text = self:safeStr(current_song.title, "Sin título")
         subtitle_text = self:safeStr(current_song.artist, "Artista desconocido") ..
-            "  -  " .. self:safeStr(current_song.album, "")
+            "  —  " .. self:safeStr(current_song.album, "")
     end
 
-    -- 1) Texto, boton y caratula cacheada: todo sin red.
     if not self.player_dialog then
-        self:buildPlayerDialog(title_text, subtitle_text, is_playing, cover_id)
+        self.player_dialog = PlayerDialog:new{
+            plugin = self,
+            cover_id = cover_id,
+            title_text = title_text,
+            subtitle_text = subtitle_text,
+            is_playing = is_playing,
+        }
+        UIManager:show(self.player_dialog)
     else
-        self:setPlayerText(title_text, subtitle_text, is_playing)
-        self:setPlayerCover(cover_id, 400)
+        -- Texto y carátula en caché ya mismo; si la carátula no está,
+        -- se descarga en su propio tick para no bloquear la UI.
+        self.player_dialog:setText(title_text, subtitle_text, is_playing)
+        self.player_dialog:setCover(cover_id)
         UIManager:setDirty(self.player_dialog, "ui")
     end
     UIManager:forceRePaint()
 
-    -- 2) Si la caratula no estaba en cache, se descarga en su propio tick
-    --    para no bloquear la UI (esto era lo que parecia "tildar").
     if cover_id and cover_id ~= "" and not self:getCachedCoverPath(cover_id, 400) then
         UIManager:nextTick(function()
             if not self.player_dialog then return end
             local path = self:getCoverArtPath(cover_id, 400)
-            if path and self.player_dialog then
-                self:setPlayerCover(cover_id, 400)
+            if path then
+                self.player_dialog:setCover(cover_id)
                 UIManager:setDirty(self.player_dialog, "ui")
                 UIManager:forceRePaint()
             end
@@ -724,148 +892,6 @@ function NavidromePlugin:refreshNowPlaying()
     end
 end
 
-function NavidromePlugin:buildPlayerDialog(title_text, subtitle_text, is_playing, cover_id)
-    self:closeNowPlaying()
-
-    local content_width = Screen:getWidth() * 0.8
-    self.player_cover_size = math.floor(Screen:getWidth() * 0.6)
-
-    -- Contenedor de tamano fijo: mantiene el layout estable cuando
-    -- pasamos del marcador musical a la caratula real.
-    self.player_cover_holder = CenterContainer:new{
-        dimen = { w = self.player_cover_size, h = self.player_cover_size },
-    }
-
-    self.player_title_widget = TextBoxWidget:new{
-        text = title_text or "",
-        width = content_width,
-        face = Font:getFace("cfont", 20),
-        alignment = "center",
-    }
-    self.player_subtitle_widget = TextBoxWidget:new{
-        text = subtitle_text or "",
-        width = content_width,
-        face = Font:getFace("cfont", 16),
-        alignment = "center",
-    }
-
-    local btn_size = Screen:scaleBySize(56)
-    self.player_playpause_btn = Button:new{
-        text = is_playing and "||" or ">",
-        width = btn_size,
-        callback = function() self:playerToggle(is_playing) end,
-    }
-    local buttons_row = HorizontalGroup:new{
-        Button:new{
-            text = "<<",
-            width = btn_size,
-            callback = function() self:playerSkip(-1) end,
-        },
-        self.player_playpause_btn,
-        Button:new{
-            text = ">>",
-            width = btn_size,
-            callback = function() self:playerSkip(1) end,
-        },
-        Button:new{
-            text = "Shuffle",
-            width = btn_size,
-            callback = function() self:playerShuffle() end,
-        },
-        Button:new{
-            text = "Refresh",
-            width = btn_size,
-            callback = function() self:refreshNowPlaying() end,
-        },
-        Button:new{
-            text = "X",
-            width = btn_size,
-            callback = function() self:closeNowPlaying() end,
-        },
-    }
-
-    self.player_text_group = VerticalGroup:new{
-        align = "center",
-        self.player_title_widget,
-        self.player_subtitle_widget,
-    }
-    self.player_content_group = VerticalGroup:new{
-        align = "center",
-        self.player_cover_holder,
-        self.player_text_group,
-        buttons_row,
-    }
-
-    local dialog = CenterContainer:new{
-        dimen = Screen:getSize(),
-        modal = true,
-        -- Consume los toques que no caigan en un boton, para que no se
-        -- filtren al menu que queda por debajo del reproductor.
-        onTap = function() return true end,
-        FrameContainer:new{
-            background = Blitbuffer.COLOR_WHITE,
-            radius = Size.radius.window,
-            padding = Size.padding.large,
-            bordersize = Size.border.window,
-            self.player_content_group,
-        },
-    }
-
-    self.player_dialog = dialog
-    UIManager:show(dialog)
-
-    -- Rellena caratula y textos una vez el dialogo ya existe.
-    self:setPlayerCover(cover_id, 400)
-    self:setPlayerText(title_text, subtitle_text, is_playing)
-end
-
-function NavidromePlugin:setPlayerText(title_text, subtitle_text, is_playing)
-    if not self.player_dialog then return end
-    if self.player_title_widget and title_text then
-        self.player_title_widget:setText(title_text)
-    end
-    if self.player_subtitle_widget and subtitle_text then
-        self.player_subtitle_widget:setText(subtitle_text)
-    end
-    if self.player_playpause_btn then
-        self.player_playpause_btn:setText(is_playing and "||" or ">")
-    end
-    -- Los contenedores cachean su tamano; hay que invalidarlo tras cambiar
-    -- el texto para que el layout se recalcule.
-    if self.player_text_group then self.player_text_group:resetLayout() end
-    if self.player_content_group then self.player_content_group:resetLayout() end
-end
-
--- Actualiza la caratula in-place. Si ya se muestra esa misma imagen no la
--- vuelve a reconstruir (asi no parpadea al refrescar).
-function NavidromePlugin:setPlayerCover(cover_id, size)
-    local holder = self.player_cover_holder
-    if not holder then return end
-
-    size = tonumber(size) or 400
-    local path = self:getCachedCoverPath(cover_id, size)
-    local key = tostring(cover_id or "") .. "|" .. tostring(path or "")
-    if self.player_cover_shown_key == key and holder[1] then
-        return
-    end
-
-    holder:clear()
-    if path then
-        table.insert(holder, ImageWidget:new{
-            file = path,
-            width = self.player_cover_size,
-            height = self.player_cover_size,
-        })
-    else
-        table.insert(holder, TextWidget:new{
-            text = "Musica",
-            face = Font:getFace("cfont", 24),
-        })
-    end
-    self.player_cover_shown_key = key
-
-    if self.player_content_group then self.player_content_group:resetLayout() end
-end
 function NavidromePlugin:playerToggle(is_playing)
     local action = is_playing and "stop" or "start"
     local response, err = self:apiRequest("jukeboxControl.view", {{ "action", action }})
@@ -876,7 +902,7 @@ end
 function NavidromePlugin:playerSkip(direction)
     local current = self.player_current_index or 0
     local length = self.player_queue_length or 0
-    if length == 0 then self:showMessage("La cola esta vacia."); return end
+    if length == 0 then self:showMessage("La cola está vacía."); return end
 
     local new_index = current + direction
     if new_index < 0 then new_index = 0 end
