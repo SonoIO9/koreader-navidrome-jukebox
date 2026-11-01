@@ -30,6 +30,33 @@ local ltn12 = require("ltn12")
 local API_VERSION = "1.12.0"
 local CLIENT_NAME = "koreader-navidrome"
 
+-- Iconos del conjunto FontAwesome que trae la fuente Nerd Font incluida en
+-- KOReader (resources/fonts/nerdfonts/symbols.ttf, siempre presente en la
+-- cadena de fuentes de reserva). Los emoji a color (lupa, dado, llave...)
+-- NO estan en ninguna fuente que KOReader empaquete, por eso salian en blanco.
+local ICONS = {
+    player   = "\u{f025}", -- auriculares
+    search   = "\u{f002}", -- lupa
+    recent   = "\u{f017}", -- reloj
+    random   = "\u{f074}", -- aleatorio (flechas cruzadas)
+    top      = "\u{f06d}", -- llama
+    discover = "\u{f005}", -- estrella
+    quick    = "\u{f1de}", -- controles
+    config   = "\u{f013}", -- engranaje
+    artist   = "\u{f130}", -- micrófono
+    album    = "\u{f001}", -- nota musical
+    cover    = "\u{f03e}", -- imagen
+    add      = "\u{f067}", -- más
+    prev     = "\u{f048}", -- anterior
+    play     = "\u{f04b}",
+    stop     = "\u{f04d}",
+    next     = "\u{f051}", -- siguiente
+    shuffle  = "\u{f074}",
+    refresh  = "\u{f021}", -- recargar
+    close    = "\u{f00d}", -- aspa
+    trash    = "\u{f1f8}", -- papelera
+}
+
 --------------------------------------------------------------------------
 -- Diálogo del reproductor (Now Playing)
 --
@@ -77,19 +104,32 @@ function PlayerDialog:init()
         self.subtitle_widget,
     }
 
-    local btn_size = Screen:scaleBySize(56)
-    self.playpause_btn = Button:new{
-        text = self.is_playing and "⏹" or "▶",
-        width = btn_size,
-        callback = function() plugin:playerToggle(self.is_playing) end,
-    }
+    -- Botones cuadrados de tamaño fijo. Sin 'height'/'width' fijos, al
+    -- cambiar el glifo (play <-> stop) Button:setText() reinicializa el
+    -- botón y el cuadro se encoge al tamaño del icono.
+    local btn_size = Screen:scaleBySize(52)
+    self.btn_size = btn_size
+    local function player_button(icon, callback)
+        return Button:new{
+            text = icon,
+            width = btn_size,
+            height = btn_size,
+            margin = 0,
+            padding = Screen:scaleBySize(2),
+            text_font_size = 22,
+            callback = callback,
+        }
+    end
+    self.playpause_btn = player_button(
+        self.is_playing and ICONS.stop or ICONS.play,
+        function() plugin:playerToggle(self.is_playing) end)
     self.buttons_row = HorizontalGroup:new{
-        Button:new{ text = "◀◀", width = btn_size, callback = function() plugin:playerSkip(-1) end },
+        player_button(ICONS.prev, function() plugin:playerSkip(-1) end),
         self.playpause_btn,
-        Button:new{ text = "▶▶", width = btn_size, callback = function() plugin:playerSkip(1) end },
-        Button:new{ text = "🔀", width = btn_size, callback = function() plugin:playerShuffle() end },
-        Button:new{ text = "⟳", width = btn_size, callback = function() plugin:refreshNowPlaying() end },
-        Button:new{ text = "✕", width = btn_size, callback = function() self:onClose() end },
+        player_button(ICONS.next, function() plugin:playerSkip(1) end),
+        player_button(ICONS.shuffle, function() plugin:playerShuffle() end),
+        player_button(ICONS.refresh, function() plugin:refreshNowPlaying() end),
+        player_button(ICONS.close, function() self:onClose() end),
     }
 
     self.content_group = VerticalGroup:new{
@@ -133,7 +173,9 @@ function PlayerDialog:setText(title, subtitle, is_playing)
     if subtitle then self.subtitle_widget:setText(subtitle) end
     if is_playing ~= nil then
         self.is_playing = is_playing
-        self.playpause_btn:setText(is_playing and "⏹" or "▶")
+        -- Hay que pasar el ancho para conservar la geometría del botón
+        -- (si no, Button:setText lo reinicializa y el cuadro se encoge).
+        self.playpause_btn:setText(is_playing and ICONS.stop or ICONS.play, self.btn_size)
     end
     -- Los contenedores cachean su tamaño; hay que invalidarlo al cambiar
     -- el texto para que el layout se recalcule.
@@ -160,7 +202,7 @@ function PlayerDialog:setCover(cover_id)
         })
     else
         table.insert(self.cover_holder, TextWidget:new{
-            text = "🎵",
+            text = ICONS.cover,
             face = Font:getFace("cfont", 60),
         })
     end
@@ -434,24 +476,24 @@ end
 
 function NavidromePlugin:showMainMenu()
     local items = {
-        { text = "▶  Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
-        { text = "🔎  Buscar música", callback = function() self:showSearch() end },
-        { text = "🆕  Álbumes recién añadidos", callback = function() self:showRecentAlbums() end },
-        { text = "🎲  Álbumes aleatorios", callback = function() self:showRandomAlbums() end },
-        { text = "🔥  Artistas más escuchados", callback = function() self:showTopArtists() end },
-        { text = "✨  Descubre artistas", callback = function() self:showRecommendedArtists() end },
-        { text = "⚙  Controles rápidos del Jukebox", callback = function() self:showQuickControls() end },
-        { text = "🔧  Configurar servidor y cuenta", callback = function() self:configure(1) end },
+        { text = ICONS.player .. "  Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
+        { text = ICONS.search .. "  Buscar música", callback = function() self:showSearch() end },
+        { text = ICONS.recent .. "  Álbumes recién añadidos", callback = function() self:showRecentAlbums() end },
+        { text = ICONS.random .. "  Álbumes aleatorios", callback = function() self:showRandomAlbums() end },
+        { text = ICONS.top .. "  Artistas más escuchados", callback = function() self:showTopArtists() end },
+        { text = ICONS.discover .. "  Descubre artistas", callback = function() self:showRecommendedArtists() end },
+        { text = ICONS.quick .. "  Controles rápidos del Jukebox", callback = function() self:showQuickControls() end },
+        { text = ICONS.config .. "  Configurar servidor y cuenta", callback = function() self:configure(1) end },
     }
     UIManager:show(Menu:new{ title = "Navidrome Jukebox", item_table = items })
 end
 
 function NavidromePlugin:showQuickControls()
     local items = {
-        { text = "⏹  Detener reproducción", callback = function() self:jukeboxAction("stop") end },
-        { text = "▶  Reanudar reproducción", callback = function() self:jukeboxAction("start") end },
-        { text = "⏭  Siguiente canción", callback = function() self:jukeboxAction("skip") end },
-        { text = "🗑  Vaciar cola", callback = function() self:jukeboxAction("clear") end },
+        { text = ICONS.stop .. "  Detener reproducción", callback = function() self:jukeboxAction("stop") end },
+        { text = ICONS.play .. "  Reanudar reproducción", callback = function() self:jukeboxAction("start") end },
+        { text = ICONS.next .. "  Siguiente canción", callback = function() self:jukeboxAction("skip") end },
+        { text = ICONS.trash .. "  Vaciar cola", callback = function() self:jukeboxAction("clear") end },
     }
     UIManager:show(Menu:new{ title = "Controles rápidos", item_table = items })
 end
@@ -572,7 +614,7 @@ function NavidromePlugin:performSearch(query)
             if artist.id then
                 local id = tostring(artist.id)
                 local name = self:safeStr(artist.name, "Artista desconocido")
-                table.insert(items, { text = "🎤  " .. name,
+                table.insert(items, { text = ICONS.artist .. "  " .. name,
                     callback = function() self:showArtist(id, name) end })
             end
         end
@@ -584,7 +626,7 @@ function NavidromePlugin:performSearch(query)
                 local id = tostring(album.id)
                 local name = self:safeStr(album.name or album.title, "Álbum sin nombre")
                 local artist = self:safeStr(album.artist, "Varios")
-                table.insert(items, { text = "💿  " .. name .. " — " .. artist,
+                table.insert(items, { text = ICONS.album .. "  " .. name .. " — " .. artist,
                     callback = function() self:showAlbum(id, name) end })
             end
         end
@@ -596,7 +638,7 @@ function NavidromePlugin:performSearch(query)
                 local id = tostring(song.id)
                 local title = self:safeStr(song.title, "Canción sin título")
                 local artist = self:safeStr(song.artist, "Artista desconocido")
-                table.insert(items, { text = "▶  " .. title .. " — " .. artist,
+                table.insert(items, { text = ICONS.play .. "  " .. title .. " — " .. artist,
                     callback = function() self:playSongs({ id }, title) end })
             end
         end
@@ -617,7 +659,7 @@ function NavidromePlugin:showArtist(id, name)
             local album_id = tostring(album.id)
             local album_name = self:safeStr(album.name or album.title, "Álbum sin nombre")
             local year = self:safeStr(album.year, "")
-            local label = "💿  " .. album_name
+            local label = ICONS.album .. "  " .. album_name
             if year ~= "" then label = label .. " (" .. year .. ")" end
             table.insert(items, { text = label,
                 callback = function() self:showAlbum(album_id, album_name) end })
@@ -639,13 +681,13 @@ function NavidromePlugin:showAlbum(id, title)
     end
 
     local cover_id = album.coverArt or id
-    table.insert(items, { text = "🖼  Ver portada",
+    table.insert(items, { text = ICONS.cover .. "  Ver portada",
         callback = function() self:showCoverArt(cover_id, title) end })
 
     if #playable_ids > 0 then
-        table.insert(items, { text = "▶  Reproducir álbum ahora",
+        table.insert(items, { text = ICONS.play .. "  Reproducir álbum ahora",
             callback = function() self:playSongs(playable_ids, title) end })
-        table.insert(items, { text = "➕  Añadir álbum a la cola",
+        table.insert(items, { text = ICONS.add .. "  Añadir álbum a la cola",
             callback = function() self:addSongs(playable_ids, title) end })
         table.insert(items, { text = "— CANCIONES —", callback = function() end })
     end
@@ -694,11 +736,11 @@ function NavidromePlugin:showAlbumList(title, list_type, size)
 end
 
 function NavidromePlugin:showRecentAlbums()
-    self:showAlbumList("🆕  Álbumes recién añadidos", "newest", 25)
+    self:showAlbumList(ICONS.recent .. "  Álbumes recién añadidos", "newest", 25)
 end
 
 function NavidromePlugin:showRandomAlbums()
-    self:showAlbumList("🎲  Álbumes aleatorios", "random", 25)
+    self:showAlbumList(ICONS.random .. "  Álbumes aleatorios", "random", 25)
 end
 
 -- Aproximación de "artistas más escuchados": no existe un endpoint oficial
@@ -732,7 +774,7 @@ function NavidromePlugin:showTopArtists()
     for _, key in ipairs(order) do
         local data = artist_data[key]
         table.insert(items, {
-            text = "🎤  " .. data.name .. "  (≈" .. data.score .. " reproducciones)",
+            text = ICONS.artist .. "  " .. data.name .. "  (≈" .. data.score .. " reproducciones)",
             callback = function()
                 if data.id then
                     self:showArtist(data.id, data.name)
@@ -746,7 +788,7 @@ function NavidromePlugin:showTopArtists()
         self:showMessage("Aún no hay suficiente historial de reproducción en el servidor.")
         return
     end
-    UIManager:show(Menu:new{ title = "🔥  Artistas más escuchados", item_table = items })
+    UIManager:show(Menu:new{ title = ICONS.top .. "  Artistas más escuchados", item_table = items })
 end
 
 -- "Recomendación" real: la API Subsonic/Navidrome no ofrece un motor de
@@ -778,11 +820,11 @@ function NavidromePlugin:showRecommendedArtists()
         local id = tostring(artist.id)
         local name = self:safeStr(artist.name, "Artista desconocido")
         table.insert(items, {
-            text = "✨  " .. name,
+            text = ICONS.discover .. "  " .. name,
             callback = function() self:showArtist(id, name) end,
         })
     end
-    UIManager:show(Menu:new{ title = "✨  Descubre artistas (selección aleatoria)", item_table = items })
+    UIManager:show(Menu:new{ title = ICONS.discover .. "  Descubre artistas (selección aleatoria)", item_table = items })
 end
 
 --------------------------------------------------------------------------
