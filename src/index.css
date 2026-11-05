@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --eink-bg: #f5f4ef;
+    --eink-paper: #ffffff;
+    --eink-ink: #111111;
+    --eink-border: #222222;
+    --eink-dim: #555555;
+  }
+}
+
+/* KOReader E-Ink simulated look */
+.eink-mode {
+  background-color: var(--eink-bg);
+  color: var(--eink-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  image-rendering: auto;
+}
+
+.eink-border {
+  border: 2px solid var(--eink-border);
+}
+
+.eink-btn {
+  background-color: #ffffff;
+  border: 2px solid #222222;
+  box-shadow: 2px 2px 0px #000000;
+  transition: transform 0.05s ease, box-shadow 0.05s ease;
+}
+
+.eink-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 0px 0px 0px #000000;
+}
+
+/* Simulated e-ink refresh flash */
+@keyframes eink-flash {
+  0% { opacity: 1; filter: invert(0); }
+  40% { opacity: 0.9; filter: invert(1); }
+  60% { opacity: 0.95; filter: invert(1); }
+  100% { opacity: 1; filter: invert(0); }
+}
+
+.eink-flashing {
+  animation: eink-flash 0.28s ease-in-out;
+}

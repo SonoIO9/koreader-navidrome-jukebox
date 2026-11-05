@@ -24,6 +24,7 @@ local DataStorage = require("datastorage")
 local util = require("util")
 local rapidjson = require("rapidjson")
 local http = require("socket.http")
+local https_ok, https = pcall(require, "ssl.https")
 local socketutil = require("socketutil")
 local ltn12 = require("ltn12")
 
@@ -37,6 +38,7 @@ local CLIENT_NAME = "koreader-navidrome"
 local ICONS = {
     player   = "\u{f025}", -- auriculares
     search   = "\u{f002}", -- lupa
+    radio    = "\u{f1be}", -- señal / emisora de radio
     recent   = "\u{f017}", -- reloj
     random   = "\u{f074}", -- aleatorio (flechas cruzadas)
     top      = "\u{f06d}", -- llama
@@ -271,29 +273,108 @@ function NavidromePlugin:addToMainMenu(menu_items)
 end
 
 --------------------------------------------------------------------------
--- Configuración y ajustes
+-- Configuración y ajustes persistentes
 --------------------------------------------------------------------------
 
+function NavidromePlugin:getSettingsFile()
+    local ok, path = pcall(function() return DataStorage:getDataDir() end)
+    local dir = (ok and path) and (path .. "/settings") or "/tmp"
+    pcall(util.makePath, dir)
+    return dir .. "/navidrome_plugin.json"
+end
+
+function NavidromePlugin:loadPluginSettings()
+    if self.cached_settings then return self.cached_settings end
+    local settings = {}
+    local filename = self:getSettingsFile()
+    if util and util.fileExists and util.fileExists(filename) then
+        local f = io.open(filename, "r")
+        if f then
+            local content = f:read("*a")
+            f:close()
+            local ok, parsed = pcall(rapidjson.decode, content)
+            if ok and type(parsed) == "table" then
+                settings = parsed
+            end
+        end
+    end
+    self.cached_settings = settings
+    return settings
+end
+
+function NavidromePlugin:persistPluginSettings()
+    local filename = self:getSettingsFile()
+    local ok, json_str = pcall(rapidjson.encode, self.cached_settings or {})
+    if ok and json_str then
+        local f = io.open(filename, "w")
+        if f then
+            f:write(json_str)
+            f:close()
+        end
+    end
+end
+
 function NavidromePlugin:getSetting(key, default)
+    if not self.cached_settings then
+        self:loadPluginSettings()
+    end
+    if self.cached_settings[key] ~= nil and self.cached_settings[key] ~= "" then
+        return self.cached_settings[key]
+    end
     if G_reader_settings then
         local value = G_reader_settings:readSetting("navidrome_" .. key)
-        if value ~= nil then return value end
+        if value ~= nil and value ~= "" then
+            self.cached_settings[key] = value
+            return value
+        end
     end
     return default
 end
 
 function NavidromePlugin:saveSetting(key, value)
+    if not self.cached_settings then
+        self:loadPluginSettings()
+    end
+    self.cached_settings[key] = value
     if G_reader_settings then
         G_reader_settings:saveSetting("navidrome_" .. key, value)
+        if type(G_reader_settings.flush) == "function" then
+            pcall(function() G_reader_settings:flush() end)
+        end
     end
+    self:persistPluginSettings()
 end
 
 function NavidromePlugin:getConfig()
+    local raw_url = tostring(self:getSetting("url", "")):gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+    local user = tostring(self:getSetting("user", "")):gsub("^%s+", ""):gsub("%s+$", "")
+    local pass = tostring(self:getSetting("pass", ""))
+
+    -- Si el usuario omitió http:// o https://, lo autocompletamos con http:// para evitar que socket.http se cuelgue
+    if raw_url ~= "" and not raw_url:match("^https?://") then
+        raw_url = "http://" .. raw_url
+    end
+
     return {
-        url = tostring(self:getSetting("url", "")):gsub("/+$", ""),
-        user = tostring(self:getSetting("user", "")),
-        pass = tostring(self:getSetting("pass", "")),
+        url = raw_url,
+        user = user,
+        pass = pass,
     }
+end
+
+-- Salvaguarda previa a cualquier petición
+function NavidromePlugin:validateConfig()
+    local config = self:getConfig()
+    if config.url == "" then
+        return nil, "Falta la URL del servidor Navidrome.\nEntra en 'Configurar servidor y cuenta' para introducirla."
+    end
+    if config.user == "" then
+        return nil, "Falta el nombre de usuario de Navidrome.\nEntra en 'Configurar servidor y cuenta' para introducirlo."
+    end
+    if config.pass == "" then
+        return nil, "Falta la contraseña de Navidrome.\nEntra en 'Configurar servidor y cuenta' para introducirla."
+    end
+    return config
 end
 
 --------------------------------------------------------------------------
@@ -321,9 +402,9 @@ end
 
 -- Devuelve el JSON decodificado o nil y un mensaje de error legible.
 function NavidromePlugin:apiRequest(endpoint, params)
-    local config = self:getConfig()
-    if config.url == "" or config.user == "" or config.pass == "" then
-        return nil, "Configura la dirección del servidor y las credenciales primero."
+    local config, cfg_err = self:validateConfig()
+    if not config then
+        return nil, cfg_err
     end
 
     local query_params = {
@@ -340,34 +421,58 @@ function NavidromePlugin:apiRequest(endpoint, params)
     local url = config.url .. "/rest/" .. endpoint .. "?" .. self:makeQuery(query_params)
     local response_body = {}
 
-    -- Timeouts acotados: sin esto LuaSocket espera hasta 60 s y la UI
-    -- parece "colgada" hasta que el usuario toca la pantalla.
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local ok, result, code, _, status = pcall(http.request, {
+    local is_https = url:match("^https://") ~= nil
+    if is_https and not https_ok then
+        return nil, "El servidor usa HTTPS pero el módulo SSL (ssl.https) no está disponible en este KOReader.\nPor favor, usa HTTP (ej: http://...)."
+    end
+
+    local req_func = (is_https and https_ok) and https.request or http.request
+
+    -- Tiempos de espera reducidos y controlados para que NUNCA se congele o bloquee la interfaz
+    local CONNECT_TIMEOUT = 5
+    local TOTAL_TIMEOUT = 12
+    if socketutil and socketutil.set_timeout then
+        pcall(function() socketutil:set_timeout(CONNECT_TIMEOUT, TOTAL_TIMEOUT) end)
+    end
+
+    local ok, result, code, headers, status = pcall(req_func, {
         url = url,
         method = "GET",
         sink = ltn12.sink.table(response_body),
         redirect = true,
+        timeout = TOTAL_TIMEOUT,
     })
-    socketutil:reset_timeout()
+
+    if socketutil and socketutil.reset_timeout then
+        pcall(function() socketutil:reset_timeout() end)
+    end
 
     if not ok then
-        local desc = socketutil.describe_error(result)
-        return nil, "No se pudo conectar: " .. tostring(desc or result)
+        local desc = (socketutil and socketutil.describe_error) and socketutil.describe_error(result) or result
+        return nil, "No se pudo conectar al servidor:\n" .. tostring(desc or result)
     end
-    if result ~= 1 or tonumber(code) ~= 200 then
-        local desc = socketutil.describe_error(result)
+
+    local status_num = tonumber(code)
+    if result ~= 1 or status_num ~= 200 then
+        if status_num == 401 then
+            return nil, "Error 401: Usuario o contraseña incorrectos en Navidrome."
+        elseif status_num == 404 then
+            return nil, "Error 404: Ruta de API no encontrada en '" .. tostring(config.url) .. "'. Revisa la URL."
+        elseif status_num == 403 then
+            return nil, "Error 403: El usuario no tiene permisos suficientes en Navidrome."
+        end
+        local desc = (socketutil and socketutil.describe_error) and socketutil.describe_error(result) or status
         return nil, tostring(desc or status or ("Error HTTP " .. tostring(code or "desconocido")))
     end
 
     local decoded_ok, data = pcall(rapidjson.decode, table.concat(response_body))
     if not decoded_ok or type(data) ~= "table" then
-        return nil, "El servidor devolvió una respuesta JSON inválida."
+        return nil, "El servidor respondió pero no devolvió JSON válido de Subsonic."
     end
 
     local response = data["subsonic-response"]
     if type(response) ~= "table" then
-        return nil, "Respuesta inesperada del servidor."
+        return nil, "Respuesta inesperada del servidor Navidrome."
     end
     if response.status == "failed" then
         local message = response.error and response.error.message
@@ -478,12 +583,13 @@ function NavidromePlugin:showMainMenu()
     local items = {
         { text = ICONS.player .. "  Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
         { text = ICONS.search .. "  Buscar música", callback = function() self:showSearch() end },
+        { text = ICONS.radio .. "  Radios de Navidrome", callback = function() self:showRadios() end },
         { text = ICONS.recent .. "  Álbumes recién añadidos", callback = function() self:showRecentAlbums() end },
         { text = ICONS.random .. "  Álbumes aleatorios", callback = function() self:showRandomAlbums() end },
         { text = ICONS.top .. "  Artistas más escuchados", callback = function() self:showTopArtists() end },
         { text = ICONS.discover .. "  Descubre artistas", callback = function() self:showRecommendedArtists() end },
         { text = ICONS.quick .. "  Controles rápidos del Jukebox", callback = function() self:showQuickControls() end },
-        { text = ICONS.config .. "  Configurar servidor y cuenta", callback = function() self:configure(1) end },
+        { text = ICONS.config .. "  Configurar servidor y cuenta", callback = function() self:showConfigMenu() end },
     }
     UIManager:show(Menu:new{ title = "Navidrome Jukebox", item_table = items })
 end
@@ -498,41 +604,191 @@ function NavidromePlugin:showQuickControls()
     UIManager:show(Menu:new{ title = "Controles rápidos", item_table = items })
 end
 
-function NavidromePlugin:configure(field_index)
-    local fields = {
-        { key = "url", title = "Servidor Navidrome", hint = "Ejemplo: https://musica.ejemplo.com" },
-        { key = "user", title = "Usuario Navidrome", hint = "Nombre de usuario" },
-        { key = "pass", title = "Contraseña Navidrome", hint = "Se guarda localmente en KOReader" },
-    }
-    local field = fields[field_index]
-    if not field then
-        self:showMessage("Configuración guardada. Comprueba la conexión desde Buscar música.")
+--------------------------------------------------------------------------
+-- Radios de Navidrome (Internet Radio Stations)
+--------------------------------------------------------------------------
+
+function NavidromePlugin:showRadios()
+    local config, cfg_err = self:validateConfig()
+    if not config then
+        self:showError(cfg_err)
         return
     end
 
+    local response, err = self:apiRequest("getInternetRadioStations.view", {})
+    if not response then
+        self:showError(err)
+        return
+    end
+
+    local stations_container = response.internetRadioStations
+    local raw_stations = stations_container and stations_container.station
+    local stations = self:safeList(raw_stations)
+
+    if #stations == 0 then
+        self:showMessage("No tienes emisoras de radio configuradas en Navidrome.\nAñade tus radios favoritas desde la sección 'Radios' en la web de Navidrome.")
+        return
+    end
+
+    local items = {}
+    for _, station in ipairs(stations) do
+        if station.id or station.streamUrl then
+            local station_id = tostring(station.id or station.streamUrl)
+            local station_name = self:safeStr(station.name, "Radio sin nombre")
+            table.insert(items, {
+                text = ICONS.radio .. "  " .. station_name,
+                callback = function()
+                    self:showRadioOptions(station_id, station_name, station.streamUrl)
+                end,
+            })
+        end
+    end
+
+    UIManager:show(Menu:new{ title = "Radios de Navidrome", item_table = items })
+end
+
+function NavidromePlugin:showRadioOptions(id, name, stream_url)
+    local items = {
+        {
+            text = ICONS.play .. "  Reproducir radio ahora",
+            callback = function()
+                self:playRadio(id, name)
+            end,
+        },
+        {
+            text = ICONS.add .. "  Añadir radio a la cola",
+            callback = function()
+                self:addRadio(id, name)
+            end,
+        },
+    }
+    if stream_url and stream_url ~= "" then
+        local display_url = tostring(stream_url)
+        if display_url:len() > 36 then
+            display_url = display_url:sub(1, 33) .. "..."
+        end
+        table.insert(items, {
+            text = "URL: " .. display_url,
+            callback = function()
+                self:showMessage(name .. "\n" .. tostring(stream_url))
+            end,
+        })
+    end
+    UIManager:show(Menu:new{ title = "Radio: " .. name, item_table = items })
+end
+
+function NavidromePlugin:playRadio(id, name)
+    local response, err = self:jukeboxWithIds("set", { id })
+    if not response then
+        self:showError(err)
+        return
+    end
+    response, err = self:apiRequest("jukeboxControl.view", {{ "action", "start" }})
+    if not response then self:showError(err); return end
+    self:showMessage("Reproduciendo radio:\n" .. tostring(name or id))
+end
+
+function NavidromePlugin:addRadio(id, name)
+    local response, err = self:jukeboxWithIds("add", { id })
+    if not response then self:showError(err); return end
+    self:showMessage("Radio añadida a la cola:\n" .. tostring(name or id))
+end
+
+--------------------------------------------------------------------------
+-- Menú de configuración y prueba de conexión
+--------------------------------------------------------------------------
+
+function NavidromePlugin:showConfigMenu()
+    local config = self:getConfig()
+    local url_label = config.url ~= "" and config.url or "(No configurada)"
+    local user_label = config.user ~= "" and config.user or "(No configurado)"
+    local pass_label = config.pass ~= "" and "••••••••" or "(No configurada)"
+
+    local items = {
+        {
+            text = ICONS.config .. "  1. Servidor: " .. url_label,
+            callback = function()
+                self:promptEditField("url", "Servidor Navidrome", "Ej: http://192.168.1.100:4533 o https://musica.ejemplo.com")
+            end,
+        },
+        {
+            text = ICONS.artist .. "  2. Usuario: " .. user_label,
+            callback = function()
+                self:promptEditField("user", "Usuario Navidrome", "Nombre de usuario de Navidrome")
+            end,
+        },
+        {
+            text = ICONS.quick .. "  3. Contraseña: " .. pass_label,
+            callback = function()
+                self:promptEditField("pass", "Contraseña Navidrome", "Contraseña de tu cuenta")
+            end,
+        },
+        {
+            text = ICONS.refresh .. "  4. Probar conexión ahora",
+            callback = function()
+                self:testConnection()
+            end,
+        },
+    }
+    UIManager:show(Menu:new{ title = "Configurar servidor y cuenta", item_table = items })
+end
+
+function NavidromePlugin:promptEditField(key, title, hint)
     local config = self:getConfig()
     local dialog
     dialog = InputDialog:new{
-        title = field.title,
-        input = config[field.key],
-        input_hint = field.hint,
+        title = title,
+        input = config[key] or "",
+        input_hint = hint,
         buttons = {
             {
                 { text = "Cancelar", callback = function() UIManager:close(dialog) end },
-                { text = field_index == #fields and "Guardar" or "Siguiente", is_enter_default = true,
+                {
+                    text = "Guardar",
+                    is_enter_default = true,
                     callback = function()
                         local value = dialog:getInputText() or ""
                         UIManager:close(dialog)
-                        if field.key == "url" then
-                            value = value:gsub("%s+$", ""):gsub("^%s+", ""):gsub("/+$", "")
+                        if key == "url" then
+                            value = value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+                            if value ~= "" and not value:match("^https?://") then
+                                value = "http://" .. value
+                            end
+                        else
+                            value = value:gsub("^%s+", ""):gsub("%s+$", "")
                         end
-                        self:saveSetting(field.key, value)
-                        self:configure(field_index + 1)
-                    end },
+                        self:saveSetting(key, value)
+                        self:showMessage("Dato guardado correctamente.")
+                        UIManager:nextTick(function() self:showConfigMenu() end)
+                    end,
+                },
             },
         },
     }
     UIManager:show(dialog)
+end
+
+function NavidromePlugin:testConnection()
+    local config, err = self:validateConfig()
+    if not config then
+        self:showError(err)
+        return
+    end
+
+    self:showMessage("Probando conexión con Navidrome...\n" .. config.url)
+    UIManager:nextTick(function()
+        local response, req_err = self:apiRequest("ping.view", {})
+        if not response then
+            self:showError("Fallo de conexión:\n" .. tostring(req_err))
+        else
+            local ver = response.version or API_VERSION
+            self:showMessage("¡Conexión exitosa!\nServidor Navidrome conectado.\nSubsonic API v" .. tostring(ver))
+        end
+    end)
+end
+
+function NavidromePlugin:configure()
+    self:showConfigMenu()
 end
 
 --------------------------------------------------------------------------
@@ -576,6 +832,12 @@ end
 --------------------------------------------------------------------------
 
 function NavidromePlugin:showSearch()
+    local config, cfg_err = self:validateConfig()
+    if not config then
+        self:showError(cfg_err)
+        return
+    end
+
     local dialog
     dialog = InputDialog:new{
         title = "Buscar en Navidrome",
@@ -851,9 +1113,9 @@ end
 -- consulta al servidor para el siguiente tick de la UI. Así la pantalla
 -- nunca se queda "colgada" esperando a la red.
 function NavidromePlugin:showNowPlaying()
-    local config = self:getConfig()
-    if config.url == "" or config.user == "" or config.pass == "" then
-        self:showError("Configura la dirección del servidor y las credenciales primero.")
+    local config, cfg_err = self:validateConfig()
+    if not config then
+        self:showError(cfg_err)
         return
     end
     self:closeNowPlaying()
