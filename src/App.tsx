@@ -37,10 +37,10 @@ export function App() {
   const [isLoadingPlayer, setIsLoadingPlayer] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
-  // Modals state
+  // Modals state (null starts on the full-screen Main Menu)
   const [activeModal, setActiveModal] = useState<
     'player' | 'search' | 'radios' | 'quick' | 'config' | 'queue' | 'recent' | 'random' | 'top' | 'discover' | null
-  >('player'); // Replicates opening PlayerDialog initially
+  >(null);
 
   const [selectedAlbum, setSelectedAlbum] = useState<{ id: string; title: string } | null>(null);
   const [selectedArtist, setSelectedArtist] = useState<{ id: string; name: string } | null>(null);
@@ -190,12 +190,9 @@ export function App() {
   ];
 
   return (
-    <div className="min-h-screen flex flex-col justify-between eink-mode bg-[#f6f5f0] text-black">
-      {/* Kindle / KOReader Viewport Frame */}
-      <div className="w-full max-w-2xl mx-auto flex-1 flex flex-col p-2 sm:p-5">
-        <div className="flex-1 flex flex-col overflow-hidden bg-white border-4 border-black shadow-[6px_6px_0px_#000000]">
-          {/* Top Status Bar (Authentic KOReader E-Reader Look) */}
-          <header className="flex items-center justify-between px-4 py-2 border-b-2 border-black bg-stone-100 text-xs font-mono select-none text-black">
+    <div className="h-screen w-screen flex flex-col bg-white text-black overflow-hidden select-none">
+      {/* Top Status Bar (Authentic KOReader E-Reader Look) */}
+      <header className="flex items-center justify-between px-4 py-2 border-b-2 border-black bg-stone-100 text-xs font-mono select-none text-black shrink-0">
             <div className="flex items-center gap-2 truncate pr-2">
               <BookOpen className="w-3.5 h-3.5 shrink-0" />
               <span className="font-bold tracking-tight shrink-0">KOReader</span>
@@ -323,8 +320,6 @@ export function App() {
               </button>
             </div>
           </footer>
-        </div>
-      </div>
 
       {/* Modals */}
       {activeModal === 'player' && (

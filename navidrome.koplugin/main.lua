@@ -25,6 +25,7 @@ local util = require("util")
 local rapidjson = require("rapidjson")
 local http = require("socket.http")
 local https_ok, https = pcall(require, "ssl.https")
+local multi_ok, MultiInputDialog = pcall(require, "ui/widget/multiinputdialog")
 local socketutil = require("socketutil")
 local ltn12 = require("ltn12")
 
@@ -229,6 +230,230 @@ function PlayerDialog:onCloseWidget()
     end
     -- Repinta lo que quedaba debajo. Esto es lo que arregla el "fantasma".
     UIManager:setDirty(nil, "ui")
+end
+
+--------------------------------------------------------------------------
+-- Pantalla principal a pantalla completa (MainScreenDialog)
+--
+-- Ocupa el 100% de la pantalla del Kindle (Screen:getSize()).
+-- Estira los botones por todo el ancho de pantalla y añade un
+-- mini reproductor inferior siempre accesible.
+--------------------------------------------------------------------------
+
+local MainScreenDialog = InputContainer:extend{
+    plugin = nil,
+    modal = true,
+}
+
+function MainScreenDialog:init()
+    local plugin = self.plugin
+    local screen_w = Screen:getWidth()
+    local screen_h = Screen:getHeight()
+    self.dimen = Geom:new{ x = 0, y = 0, w = screen_w, h = screen_h }
+
+    local pad = Screen:scaleBySize(10)
+    local content_width = screen_w - pad * 2
+
+    -- 1. Cabecera superior a pantalla completa
+    local title_widget = TextWidget:new{
+        text = "Navidrome Jukebox",
+        face = Font:getFace("cfont", 22),
+        bold = true,
+    }
+    local close_btn = Button:new{
+        text = ICONS.close,
+        width = Screen:scaleBySize(44),
+        height = Screen:scaleBySize(44),
+        text_font_size = 20,
+        margin = 0,
+        padding = 0,
+        callback = function() self:onClose() end,
+    }
+
+    local header_space = content_width - (title_widget:getSize().w + Screen:scaleBySize(44) + Screen:scaleBySize(20))
+    if header_space < 10 then header_space = 10 end
+
+    local header_row = HorizontalGroup:new{
+        align = "center",
+        title_widget,
+        FrameContainer:new{ width = header_space, bordersize = 0 },
+        close_btn,
+    }
+
+    local header_frame = FrameContainer:new{
+        width = content_width,
+        padding = Size.padding.small or Screen:scaleBySize(6),
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.thin or 1,
+        radius = Size.radius.window or 4,
+        header_row,
+    }
+
+    -- 2. Botones de menú que se estiran proporcionalmente para llenar la pantalla del Kindle
+    local header_h = header_frame:getSize().h
+    local mini_h = Screen:scaleBySize(54)
+    local num_buttons = 9
+    local fixed_used = header_h + mini_h + (pad * 2)
+    local available_for_buttons = screen_h - fixed_used - Screen:scaleBySize(12)
+    local btn_spacing = Screen:scaleBySize(4)
+    local btn_height = math.floor((available_for_buttons - (btn_spacing * (num_buttons - 1))) / num_buttons)
+    if btn_height < Screen:scaleBySize(38) then btn_height = Screen:scaleBySize(38) end
+    if btn_height > Screen:scaleBySize(68) then btn_height = Screen:scaleBySize(68) end
+
+    local function main_menu_btn(icon, label, callback)
+        return Button:new{
+            text = icon .. "   " .. label,
+            width = content_width,
+            height = btn_height,
+            text_font_size = 18,
+            align = "left",
+            margin = 0,
+            padding = Screen:scaleBySize(6),
+            callback = callback,
+        }
+    end
+
+    local buttons_table = { align = "left" }
+    local menu_defs = {
+        { ICONS.player, "Reproductor (Now Playing)", function() plugin:showNowPlaying() end },
+        { ICONS.search, "Buscar música", function() plugin:showSearch() end },
+        { ICONS.radio, "Radios de Navidrome", function() plugin:showRadios() end },
+        { ICONS.recent, "Álbumes recién añadidos", function() plugin:showRecentAlbums() end },
+        { ICONS.random, "Álbumes aleatorios", function() plugin:showRandomAlbums() end },
+        { ICONS.top, "Artistas más escuchados", function() plugin:showTopArtists() end },
+        { ICONS.discover, "Descubre artistas", function() plugin:showRecommendedArtists() end },
+        { ICONS.quick, "Controles rápidos del Jukebox", function() plugin:showQuickControls() end },
+        { ICONS.config, "Configurar servidor y cuenta", function() plugin:showConfigDialog() end },
+    }
+    for i, def in ipairs(menu_defs) do
+        table.insert(buttons_table, main_menu_btn(def[1], def[2], def[3]))
+        if i < #menu_defs and btn_spacing > 0 then
+            table.insert(buttons_table, FrameContainer:new{ height = btn_spacing, bordersize = 0 })
+        end
+    end
+    self.menu_buttons_group = VerticalGroup:new(buttons_table)
+
+    -- 3. Mini reproductor en la parte inferior
+    local mini_btn_size = Screen:scaleBySize(44)
+    local is_playing = plugin.last_is_playing or false
+    local track_title = plugin.last_track_title or "Nada en reproducción"
+
+    self.mini_title = TextBoxWidget:new{
+        text = "♪ " .. track_title,
+        face = Font:getFace("cfont", 15),
+        width = content_width - (mini_btn_size * 2 + Screen:scaleBySize(25)),
+    }
+    self.mini_play_btn = Button:new{
+        text = (is_playing and ICONS.stop or ICONS.play),
+        width = mini_btn_size,
+        height = mini_btn_size,
+        text_font_size = 20,
+        margin = 0,
+        padding = 0,
+        callback = function()
+            plugin:playerToggle(plugin.last_is_playing)
+            self:updateMiniPlayer()
+        end,
+    }
+    self.mini_next_btn = Button:new{
+        text = ICONS.next,
+        width = mini_btn_size,
+        height = mini_btn_size,
+        text_font_size = 20,
+        margin = 0,
+        padding = 0,
+        callback = function()
+            plugin:playerSkip(1)
+            self:updateMiniPlayer()
+        end,
+    }
+
+    local mini_row = HorizontalGroup:new{
+        align = "center",
+        Button:new{
+            bordersize = 0,
+            margin = 0,
+            padding = 0,
+            callback = function() plugin:showNowPlaying() end,
+            self.mini_title,
+        },
+        self.mini_play_btn,
+        self.mini_next_btn,
+    }
+
+    local mini_frame = FrameContainer:new{
+        width = content_width,
+        padding = Size.padding.small or Screen:scaleBySize(6),
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.thin or 1,
+        radius = Size.radius.window or 4,
+        mini_row,
+    }
+
+    local mid_spacing = math.max(Screen:scaleBySize(4), math.floor((screen_h - (pad * 2) - header_h - mini_h - self.menu_buttons_group:getSize().h) / 2))
+
+    self.content_group = VerticalGroup:new{
+        align = "center",
+        header_frame,
+        FrameContainer:new{ height = mid_spacing, bordersize = 0 },
+        self.menu_buttons_group,
+        FrameContainer:new{ height = mid_spacing, bordersize = 0 },
+        mini_frame,
+    }
+
+    -- Contenedor raíz que cubre toda la pantalla del Kindle de borde a borde (100% pantalla)
+    self[1] = FrameContainer:new{
+        width = screen_w,
+        height = screen_h,
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = 0,
+        padding = pad,
+        margin = 0,
+        self.content_group,
+    }
+
+    self.key_events = {
+        Close = { { "Back" }, { "Home" } },
+    }
+    self.ges_events = {
+        TapAnywhere = {
+            GestureRange:new{
+                ges = "tap",
+                range = Geom:new{ x = 0, y = 0, w = screen_w, h = screen_h },
+            },
+        },
+    }
+end
+
+function MainScreenDialog:updateMiniPlayer()
+    local plugin = self.plugin
+    if not plugin then return end
+    local is_playing = plugin.last_is_playing or false
+    local track = plugin.last_track_title or "Nada en reproducción"
+    if self.mini_title then
+        self.mini_title:setText("♪ " .. tostring(track))
+    end
+    if self.mini_play_btn then
+        self.mini_play_btn:setText(is_playing and ICONS.stop or ICONS.play, Screen:scaleBySize(44))
+    end
+    self.content_group:resetLayout()
+    UIManager:setDirty(self, "ui")
+end
+
+function MainScreenDialog:onTapAnywhere()
+    return true
+end
+
+function MainScreenDialog:onClose()
+    UIManager:close(self)
+    return true
+end
+
+function MainScreenDialog:onCloseWidget()
+    if self.plugin and self.plugin.main_dialog == self then
+        self.plugin.main_dialog = nil
+    end
+    UIManager:setDirty(nil, "full")
 end
 
 local NavidromePlugin = WidgetContainer:extend{
@@ -580,18 +805,15 @@ end
 --------------------------------------------------------------------------
 
 function NavidromePlugin:showMainMenu()
-    local items = {
-        { text = ICONS.player .. "  Reproductor (Now Playing)", callback = function() self:showNowPlaying() end },
-        { text = ICONS.search .. "  Buscar música", callback = function() self:showSearch() end },
-        { text = ICONS.radio .. "  Radios de Navidrome", callback = function() self:showRadios() end },
-        { text = ICONS.recent .. "  Álbumes recién añadidos", callback = function() self:showRecentAlbums() end },
-        { text = ICONS.random .. "  Álbumes aleatorios", callback = function() self:showRandomAlbums() end },
-        { text = ICONS.top .. "  Artistas más escuchados", callback = function() self:showTopArtists() end },
-        { text = ICONS.discover .. "  Descubre artistas", callback = function() self:showRecommendedArtists() end },
-        { text = ICONS.quick .. "  Controles rápidos del Jukebox", callback = function() self:showQuickControls() end },
-        { text = ICONS.config .. "  Configurar servidor y cuenta", callback = function() self:showConfigMenu() end },
-    }
-    UIManager:show(Menu:new{ title = "Navidrome Jukebox", item_table = items })
+    if self.main_dialog then
+        UIManager:close(self.main_dialog)
+        self.main_dialog = nil
+    end
+    self.main_dialog = MainScreenDialog:new{ plugin = self }
+    UIManager:show(self.main_dialog)
+    UIManager:nextTick(function()
+        self:refreshNowPlayingQuietly()
+    end)
 end
 
 function NavidromePlugin:showQuickControls()
@@ -695,100 +917,155 @@ function NavidromePlugin:addRadio(id, name)
 end
 
 --------------------------------------------------------------------------
--- Menú de configuración y prueba de conexión
+-- Configuración en una sola ventana (Servidor, Usuario, Contraseña)
 --------------------------------------------------------------------------
 
-function NavidromePlugin:showConfigMenu()
+function NavidromePlugin:showConfigDialog()
     local config = self:getConfig()
-    local url_label = config.url ~= "" and config.url or "(No configurada)"
-    local user_label = config.user ~= "" and config.user or "(No configurado)"
-    local pass_label = config.pass ~= "" and "••••••••" or "(No configurada)"
 
-    local items = {
-        {
-            text = ICONS.config .. "  1. Servidor: " .. url_label,
-            callback = function()
-                self:promptEditField("url", "Servidor Navidrome", "Ej: http://192.168.1.100:4533 o https://musica.ejemplo.com")
-            end,
-        },
-        {
-            text = ICONS.artist .. "  2. Usuario: " .. user_label,
-            callback = function()
-                self:promptEditField("user", "Usuario Navidrome", "Nombre de usuario de Navidrome")
-            end,
-        },
-        {
-            text = ICONS.quick .. "  3. Contraseña: " .. pass_label,
-            callback = function()
-                self:promptEditField("pass", "Contraseña Navidrome", "Contraseña de tu cuenta")
-            end,
-        },
-        {
-            text = ICONS.refresh .. "  4. Probar conexión ahora",
-            callback = function()
-                self:testConnection()
-            end,
-        },
-    }
-    UIManager:show(Menu:new{ title = "Configurar servidor y cuenta", item_table = items })
+    if MultiInputDialog then
+        local dialog
+        dialog = MultiInputDialog:new{
+            title = "Configurar servidor y cuenta",
+            fields = {
+                {
+                    text = config.url,
+                    hint = "http://192.168.1.100:4533",
+                    description = "Servidor (URL):",
+                },
+                {
+                    text = config.user,
+                    hint = "Nombre de usuario",
+                    description = "Usuario:",
+                },
+                {
+                    text = config.pass,
+                    hint = "Contraseña de tu cuenta",
+                    description = "Contraseña:",
+                    type = "password",
+                },
+            },
+            buttons = {
+                {
+                    {
+                        text = "Cancelar",
+                        id = "close",
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                    {
+                        text = "Probar conexión",
+                        callback = function()
+                            local f1, f2, f3 = self:extractDialogFields(dialog)
+                            self:testConnectionWithParams(f1, f2, f3)
+                        end,
+                    },
+                    {
+                        text = "Guardar",
+                        is_enter_default = true,
+                        callback = function()
+                            local f1, f2, f3 = self:extractDialogFields(dialog)
+                            f1 = f1:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+                            if f1 ~= "" and not f1:match("^https?://") then
+                                f1 = "http://" .. f1
+                            end
+                            f2 = f2:gsub("^%s+", ""):gsub("%s+$", "")
+
+                            self:saveSetting("url", f1)
+                            self:saveSetting("user", f2)
+                            self:saveSetting("pass", f3)
+
+                            UIManager:close(dialog)
+                            self:showMessage("Configuración guardada correctamente.")
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+    else
+        self:showConfigFallback()
+    end
 end
 
-function NavidromePlugin:promptEditField(key, title, hint)
+function NavidromePlugin:extractDialogFields(dialog)
+    if not dialog then return "", "", "" end
+    if dialog.getFields then
+        local ok, res = pcall(function() return dialog:getFields() end)
+        if ok and type(res) == "table" then
+            return tostring(res[1] or ""), tostring(res[2] or ""), tostring(res[3] or "")
+        end
+    end
+    local fl = dialog._fields or dialog.fields or dialog.input_fields
+    if fl and type(fl) == "table" then
+        local f1 = fl[1] and fl[1].getText and fl[1]:getText() or ""
+        local f2 = fl[2] and fl[2].getText and fl[2]:getText() or ""
+        local f3 = fl[3] and fl[3].getText and fl[3]:getText() or ""
+        return tostring(f1 or ""), tostring(f2 or ""), tostring(f3 or "")
+    end
+    return "", "", ""
+end
+
+function NavidromePlugin:testConnectionWithParams(url, user, pass)
+    url = url:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+    if url ~= "" and not url:match("^https?://") then
+        url = "http://" .. url
+    end
+    user = user:gsub("^%s+", ""):gsub("%s+$", "")
+
+    if url == "" or user == "" or pass == "" then
+        self:showError("Completa Servidor, Usuario y Contraseña para probar.")
+        return
+    end
+
+    self:showMessage("Probando conexión con Navidrome...\n" .. url)
+    UIManager:nextTick(function()
+        local orig_url = self:getSetting("url", "")
+        local orig_user = self:getSetting("user", "")
+        local orig_pass = self:getSetting("pass", "")
+
+        self:saveSetting("url", url)
+        self:saveSetting("user", user)
+        self:saveSetting("pass", pass)
+
+        local response, err = self:apiRequest("ping.view", {})
+        if not response then
+            self:saveSetting("url", orig_url)
+            self:saveSetting("user", orig_user)
+            self:saveSetting("pass", orig_pass)
+            self:showError("Fallo de conexión:\n" .. tostring(err))
+        else
+            local ver = response.version or API_VERSION
+            self:showMessage("¡Conexión exitosa con Navidrome!\nSubsonic API v" .. tostring(ver))
+        end
+    end)
+end
+
+function NavidromePlugin:showConfigFallback()
     local config = self:getConfig()
     local dialog
     dialog = InputDialog:new{
-        title = title,
-        input = config[key] or "",
-        input_hint = hint,
+        title = "Servidor Navidrome",
+        input = config.url,
+        input_hint = "http://192.168.1.100:4533",
         buttons = {
             {
                 { text = "Cancelar", callback = function() UIManager:close(dialog) end },
-                {
-                    text = "Guardar",
-                    is_enter_default = true,
-                    callback = function()
-                        local value = dialog:getInputText() or ""
-                        UIManager:close(dialog)
-                        if key == "url" then
-                            value = value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
-                            if value ~= "" and not value:match("^https?://") then
-                                value = "http://" .. value
-                            end
-                        else
-                            value = value:gsub("^%s+", ""):gsub("%s+$", "")
-                        end
-                        self:saveSetting(key, value)
-                        self:showMessage("Dato guardado correctamente.")
-                        UIManager:nextTick(function() self:showConfigMenu() end)
-                    end,
-                },
+                { text = "Guardar", is_enter_default = true, callback = function()
+                    local val = dialog:getInputText() or ""
+                    UIManager:close(dialog)
+                    self:saveSetting("url", val)
+                    self:showMessage("Servidor guardado.")
+                end },
             },
         },
     }
     UIManager:show(dialog)
 end
 
-function NavidromePlugin:testConnection()
-    local config, err = self:validateConfig()
-    if not config then
-        self:showError(err)
-        return
-    end
-
-    self:showMessage("Probando conexión con Navidrome...\n" .. config.url)
-    UIManager:nextTick(function()
-        local response, req_err = self:apiRequest("ping.view", {})
-        if not response then
-            self:showError("Fallo de conexión:\n" .. tostring(req_err))
-        else
-            local ver = response.version or API_VERSION
-            self:showMessage("¡Conexión exitosa!\nServidor Navidrome conectado.\nSubsonic API v" .. tostring(ver))
-        end
-    end)
-end
-
 function NavidromePlugin:configure()
-    self:showConfigMenu()
+    self:showConfigDialog()
 end
 
 --------------------------------------------------------------------------
@@ -1157,12 +1434,18 @@ function NavidromePlugin:refreshNowPlaying()
 
     local cover_id = nil
     local title_text = "Nada en reproducción"
-    local subtitle_text = "Añade canciones o álbumes desde Buscar / Álbumes"
+    local subtitle_text = "Añade canciones, álbumes o radios desde el menú"
     if current_song then
         cover_id = current_song.coverArt
         title_text = self:safeStr(current_song.title, "Sin título")
         subtitle_text = self:safeStr(current_song.artist, "Artista desconocido") ..
             "  —  " .. self:safeStr(current_song.album, "")
+    end
+
+    self.last_track_title = title_text
+    self.last_is_playing = is_playing
+    if self.main_dialog then
+        self.main_dialog:updateMiniPlayer()
     end
 
     if not self.player_dialog then
@@ -1219,10 +1502,28 @@ function NavidromePlugin:playerSkip(direction)
     self:refreshNowPlaying()
 end
 
-function NavidromePlugin:playerShuffle()
-    local response, err = self:apiRequest("jukeboxControl.view", {{ "action", "shuffle" }})
-    if not response then self:showError(err); return end
-    self:refreshNowPlaying()
+function NavidromePlugin:refreshNowPlayingQuietly()
+    local config = self:getConfig()
+    if config.url == "" or config.user == "" or config.pass == "" then
+        return
+    end
+    local response, _ = self:apiRequest("jukeboxControl.view", {{ "action", "get" }})
+    if not response then return end
+    local playlist = response.jukeboxPlaylist or {}
+    local entries = self:safeList(playlist.entry)
+    local current_index = tonumber(playlist.currentIndex) or -1
+    local is_playing = (playlist.playing == true or playlist.playing == "true")
+    local current_song = entries[current_index + 1]
+    if current_song then
+        self.last_track_title = self:safeStr(current_song.title, "Sin título")
+        self.last_is_playing = is_playing
+    else
+        self.last_track_title = "Nada en reproducción"
+        self.last_is_playing = false
+    end
+    if self.main_dialog then
+        self.main_dialog:updateMiniPlayer()
+    end
 end
 
 return NavidromePlugin
