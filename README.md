@@ -30,17 +30,6 @@ explora tu biblioteca, busca música y maneja la cola de reproducción del jukeb
    - Introduce la contraseña,
    - Pulsa **Probar conexión ahora** para verificar la conexión al instante.
 
-## Notas técnicas
-
-- Los iconos usan glifos FontAwesome de la fuente Nerd Font que KOReader
-  incluye siempre en su cadena de fuentes de reserva
-  (`resources/fonts/nerdfonts/symbols.ttf`). Los emoji a color no están en
-  ninguna fuente que KOReader empaquete, por eso no se usan.
-- El diálogo del reproductor es un `InputContainer` modal: consume los toques
-  que no van a un botón y repinta lo que queda debajo al cerrarse.
-- El reproductor se muestra al instante y las peticiones de red se difieren al
-  siguiente tick de la interfaz, para que la pantalla no parezca colgada.
-
 ## Licencia
 
 MIT
