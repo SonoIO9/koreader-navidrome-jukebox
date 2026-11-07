@@ -3,14 +3,15 @@
 Controla un servidor [Navidrome](https://www.navidrome.org/) (API Subsonic) desde KOReader:
 explora tu biblioteca, busca música y maneja la cola de reproducción del jukebox.
 
-<img width="599" height="801" alt="imagen" src="https://github.com/user-attachments/assets/273f92ae-0500-4da8-98ac-768eaf812702" />
+<img width="595" height="802" alt="imagen" src="https://github.com/user-attachments/assets/8482e23d-d02c-4cad-ac14-c2d7255a414d" />
+
 
 ## Funciones
 
 - **Reproductor (Now Playing)**: carátula, título/artista/álbum y controles
   (anterior, play/stop, siguiente, aleatorio, recargar, cerrar).
 - **Buscar música** por artista, álbum o canción.
-- **Radios de Navidrome**: explora y reproduce tus emisoras de radio por internet en el jukebox. (Nop, según parece las radios no se pueden ejecutar a través de navidrome, supongo que tendré que incorporar mpv)
+- **Listas de Navidrome**: explora y reproduce tus listas.
 - **Álbumes recién añadidos** y **álbumes aleatorios**.
 - **Artistas más escuchados** (aproximado, agrupando por `playCount`).
 - **Descubre artistas**: selección aleatoria de tu biblioteca.
