@@ -10,7 +10,7 @@ explora tu biblioteca, busca música y maneja la cola de reproducción del jukeb
 - **Reproductor (Now Playing)**: carátula, título/artista/álbum y controles
   (anterior, play/stop, siguiente, aleatorio, recargar, cerrar).
 - **Buscar música** por artista, álbum o canción.
-- **Radios de Navidrome**: explora y reproduce tus emisoras de radio por internet en el jukebox.
+- **Radios de Navidrome**: explora y reproduce tus emisoras de radio por internet en el jukebox. (Nop, según parece las radios no se pueden ejecutar a través de navidrome, supongo que tendré que incorporar mpv)
 - **Álbumes recién añadidos** y **álbumes aleatorios**.
 - **Artistas más escuchados** (aproximado, agrupando por `playCount`).
 - **Descubre artistas**: selección aleatoria de tu biblioteca.
